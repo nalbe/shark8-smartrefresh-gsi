@@ -1,0 +1,6 @@
+# NDK cross-compiled probe binary
+tools/vblank_probe
+
+# Local scratch and logs
+*.log
+*.tmp

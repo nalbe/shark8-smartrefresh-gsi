@@ -1,0 +1,6 @@
+id=shark8-smartrefresh
+name=Shark8 SmartRefresh
+version=1.3
+versionCode=4
+author=jan
+description=Fix screen tearing (disable SF content detection) and replace MTK dynamic FPS with a clean touch-driven 60/120 Hz governor via DMS user-settings votes. No drm_crtc_vblank churn, no waitNextVsync EINVAL bursts, still battery-friendly on static content.
