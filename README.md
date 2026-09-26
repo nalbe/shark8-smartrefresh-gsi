@@ -103,6 +103,25 @@ Do not use `pkill -f fps_governor.sh` from an interactive adb shell: the
 pattern matches its own wrapper and kills the session. The daemon self-guards
 against double starts via the pidfile.
 
+### Startup robustness (v1.4)
+
+The daemon died at startup after every reboot for a subtle reason: the
+single-instance guard tested the pidfile pid with `kill -0` only. After a
+reboot that pid is routinely reused by an unrelated daemon (on this device
+`netd` took it), the guard saw "an instance is already running" and the
+governor exited before doing anything - permanently, until the pidfile was
+deleted by hand.
+
+v1.4 fixes this three ways:
+
+* the guard now validates `/proc/<pid>/cmdline` actually contains
+  `fps_governor`; a stale pidfile entry for any other process is cleared and
+  the daemon starts normally
+* the pidfile (and fifo) are removed on every exit path (TERM/INT/HUP trap,
+  getevent-death teardown), so a crashed instance cannot poison the next one
+* `service.sh` removes stale pidfile/fifo at boot before starting, making
+  every boot a clean start regardless of how the previous session ended
+
 ## Install
 
 ```

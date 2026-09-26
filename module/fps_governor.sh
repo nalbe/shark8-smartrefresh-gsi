@@ -30,9 +30,25 @@ logm() {
     /system/bin/log -p i -t fps_gov "$1"
 }
 
-# single-instance guard (worked when service.sh raced a manual start)
-if [ -f "$PIDFILE" ] && kill -0 "$(cat "$PIDFILE" 2>/dev/null)" 2>/dev/null; then
-    exit 0
+# True if $1 is a live process whose cmdline names this very script.
+# A plain kill -0 guard is not enough: after a reboot the pid from a stale
+# pidfile is routinely reused by an unrelated daemon (netd/system_server grab
+# low pids first); the guard then believes an instance is already running and
+# the governor exits at startup and never comes back until the pidfile is
+# removed by hand. Check the cmdline instead of trusting the pid.
+is_governor() {
+    [ -r "/proc/$1/cmdline" ] || return 1
+    grep -q "fps_governor" "/proc/$1/cmdline" 2>/dev/null
+}
+
+# single-instance guard, stale-pidfile safe
+if [ -f "$PIDFILE" ]; then
+    pid=$(cat "$PIDFILE" 2>/dev/null)
+    if [ -n "$pid" ] && is_governor "$pid"; then
+        exit 0
+    fi
+    logm "stale pidfile cleared (pid ${pid:-?})"
+    rm -f "$PIDFILE"
 fi
 echo $$ > "$PIDFILE"
 
@@ -89,8 +105,12 @@ mkfifo "$fifo" 2>/dev/null || exit 1
 getevent -t "$dev" >"$fifo" &
 gepid=$!
 
-cleanup() { kill "$gepid" 2>/dev/null; rm -f "$fifo"; exit 0; }
-trap cleanup TERM INT
+cleanup() {
+    kill "$gepid" 2>/dev/null
+    rm -f "$fifo" "$PIDFILE"
+    exit 0
+}
+trap cleanup TERM INT HUP
 
 exec 3<"$fifo"
 
@@ -124,3 +144,9 @@ while :; do
         fi
     fi
 done
+
+# getevent died: tear down cleanly (a leftover pidfile would poison the next
+# start; the guard clears stale entries anyway, but stay tidy)
+kill "$gepid" 2>/dev/null
+rm -f "$fifo" "$PIDFILE"
+logm "daemon exit (getevent died)"
