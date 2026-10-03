@@ -11,11 +11,31 @@
 # The panel is switched through DMS user-setting votes (min/peak
 # refresh_rate settings pair). Runs as a daemon started from service.sh.
 #
+# Control: the same pipe that carries the touchscreen events carries the
+# commands, so there is no state file, no signal and no poll. Both commands
+# are "<verb> <arg> <replypath>" and both are answered, a SET included, so a
+# writer knows its change landed instead of firing and hoping:
+#   SET <adaptive|60|120> <path>   hold that rate, then answer on that fifo
+#   GET -                   <path>   answer on that fifo
+# The answer is "mode=... cur=... down=...". The mode lives here and dies with
+# the process: a reboot comes back adaptive.
+#
 # Tuning: setprop persist.sys.phh.fps_gov_idle <seconds> before start.
 #         setprop persist.sys.phh.fps_gov_log 0 to disable logcat logging.
 
 TOUCH_NAME=fts_ts
-MODDIR=${0%/*}
+# Absolute, and for the same two reasons as in fps_ctl.sh: ${0%/*} is a no-op
+# on a $0 with no slash, and a relative MODDIR would put the pidfile and the
+# fifo somewhere the boot cleanup and fps_ctl.sh never look, so the two would
+# disagree about whether a governor is running.
+case "$0" in
+    */*) MODDIR=${0%/*} ;;
+    *)   MODDIR=. ;;
+esac
+case "$MODDIR" in
+    /*) ;;
+    *) MODDIR=$PWD/$MODDIR ;;
+esac
 PIDFILE=$MODDIR/.fps_gov.pid
 
 IDLE_S=6
@@ -52,31 +72,55 @@ if [ -f "$PIDFILE" ]; then
 fi
 echo $$ > "$PIDFILE"
 
-set_rate() {
-    case "$1" in
-        60)
-            settings put system min_refresh_rate 60
-            settings put system peak_refresh_rate 60
-            ;;
-        120)
-            settings put system min_refresh_rate 120
-            settings put system peak_refresh_rate 120
-            ;;
+# What we asked for vs what the system reports back: the GSI normalises 120
+# into Infinity, so that is a confirmed 120, not a mismatch.
+rate_is() {
+    case "$2" in
+        Infinity) [ "$1" = 120 ] ;;
+        *) [ "$1" = "$2" ] ;;
     esac
-    logm "set rate to $1 Hz"
 }
 
-wait_ready() {
-    i=0
-    while ! settings get system min_refresh_rate >/dev/null 2>&1; do
-        i=$((i + 1))
-        if [ "$i" -ge 45 ]; then
-            logm "settings service not ready after 90s, abort"
-            return 1
-        fi
-        sleep 2
-    done
+# Drive the panel to $1. No-op when $cur already says so. A write the system
+# did not take leaves $cur alone, which is the entire retry: the loop below
+# comes back around on its own and tries again. No readiness probe, no waiting.
+go() {
+    [ "$cur" = "$1" ] && return 0
+    settings put system min_refresh_rate "$1" || return 1
+    settings put system peak_refresh_rate "$1" || return 1
+    rate_is "$1" "$(settings get system min_refresh_rate)" || return 1
+    cur=$1
+    logm "set rate to $1 Hz"
     return 0
+}
+
+# Hold $1 until told otherwise, and remember it in the two variables the loop
+# reads: $mode (what was asked for) and $forced (1 = the panel is pinned and
+# the touch logic must keep its hands off it).
+set_mode() {
+    case "$1" in
+        60|120) mode=$1; forced=1 ;;
+        *)       mode=adaptive; forced=0 ;;
+    esac
+    if [ "$forced" = 1 ]; then
+        go "$mode"
+    else
+        # Hand the panel back: 120 now, and the idle timer may drop it after.
+        go 120
+    fi
+    logm "mode=$mode"
+}
+
+# Answer a GET on the fifo the caller created and is holding. Opened read-write
+# so this cannot block, and in a subshell because a failed redirection on
+# `exec` is fatal in the calling shell - which is the governor. A caller that
+# already gave up costs one line in a buffer nobody reads.
+answer() {
+    [ -p "$1" ] || return 0
+    (
+        exec 9<>"$1"
+        printf 'mode=%s cur=%s down=%s\n' "$mode" "$cur" "$down" >&9
+    ) 2>/dev/null
 }
 
 # Locate touchscreen by sysfs name (device index may vary across boots).
@@ -95,9 +139,11 @@ if [ -z "$dev" ]; then
 fi
 logm "touch device: $dev, idle timeout: ${IDLE_S}s"
 
-wait_ready || exit 1
-
-# FIFO bridging getevent (unbuffered writer) and the rate loop.
+# FIFO bridging getevent (unbuffered writer) and the rate loop. Holding the
+# read end for as long as this process lives is what lets a command open the
+# fifo for writing without waiting: a writer only blocks while nobody reads.
+# Keep it read-only, so a dead getevent closes the write end and the read
+# below returns at once instead of waiting out the idle timeout.
 fifo="$MODDIR/.fps_gov.fifo"
 rm -f "$fifo"
 mkfifo "$fifo" 2>/dev/null || exit 1
@@ -115,33 +161,60 @@ trap cleanup TERM INT HUP
 exec 3<"$fifo"
 
 cur=120
+mode=adaptive
+forced=0
 down=0
-# Boot state (settings normalized to Infinity) already means 120 Hz: no write.
+# When the touchscreen last said anything. Idling is a question about this
+# clock, not about the read below. The same fifo carries the control channel,
+# so one reader asking for status once a second - which is exactly what the
+# gamemode app's screen does while it is open - was enough to keep `read -t`
+# from ever timing out, and the panel sat at 120 with no finger on the glass
+# for as long as that screen stayed open. $SECONDS is a shell builtin, so
+# asking the time on the per-motion-line hot path costs no fork.
+last_touch=$SECONDS
+# Boot state (settings normalized to Infinity) already means 120, so this
+# writes nothing; it is here for the log line and the one code path.
+set_mode adaptive
 
 while :; do
-    if read -r -t "$IDLE_S" line <&3; then
+    read -r -t "$IDLE_S" line <&3
+    got=$?
+    if [ "$got" = 0 ]; then
         case "$line" in
-            *'0001 014a 00000001'*)
-                if [ "$down" != 1 ]; then down=1; logm "finger down"; fi ;;
-            *'0001 014a 00000000'*)
-                if [ "$down" != 0 ]; then down=0; logm "finger up"; fi ;;
+            # "<verb> <arg> <replypath>", all three always present.
+            SET\ *|GET\ *)
+                ctl=${line%% *}
+                rest=${line#* }
+                if [ "$ctl" = SET ]; then set_mode "${rest%% *}"; fi
+                answer "${rest#* }"
+                # Deliberately neither a `continue` nor a last_touch update: a
+                # command is not a touch, so it must not push the panel to 120
+                # and must not count as activity either. The clock at the
+                # bottom decides idling, so a caller can neither hold the panel
+                # up by asking often nor bring it down by asking at all.
+                ;;
+            *)
+                last_touch=$SECONDS
+                case "$line" in
+                    *'0001 014a 00000001'*)
+                        if [ "$down" != 1 ]; then down=1; logm "finger down"; fi ;;
+                    *'0001 014a 00000000'*)
+                        if [ "$down" != 0 ]; then down=0; logm "finger up"; fi ;;
+                esac
+                [ "$forced" = 0 ] && go 120
+                ;;
         esac
-        if [ "$cur" != 120 ]; then
-            set_rate 120
-            cur=120
-        fi
-    else
-        if ! kill -0 "$gepid" 2>/dev/null; then
-            logm "getevent died, exit"
-            break
-        fi
+    elif ! kill -0 "$gepid" 2>/dev/null; then
+        logm "getevent died, exit"
+        break
+    fi
+    if [ "$forced" = 1 ]; then
+        # a pinned rate owns the panel: no switching, no touching it
+        go "$mode"
+    elif [ "$down" = 0 ] && [ $((SECONDS - last_touch)) -ge "$IDLE_S" ]; then
         # finger still down but silent: keep 120 so mid-scan pauses do not
         # trigger a 60->120 panel switch on the next fling
-        [ "$down" = 1 ] && continue
-        if [ "$cur" != 60 ]; then
-            set_rate 60
-            cur=60
-        fi
+        go 60
     fi
 done
 
