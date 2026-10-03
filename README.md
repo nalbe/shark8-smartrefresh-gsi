@@ -5,54 +5,97 @@ scrolling at 120Hz on the Blackview Shark 8 running an AOSP/PHH GSI over the
 stock MTK vendor image, and replaces the broken dynamic-FPS with a clean
 touch-driven 60/120 Hz governor.
 
-The same two properties fix the tearing AND kill the stock dynamic FPS (they
-are the same switch: the GSI's `persist.sys.phh.dynamic_fps` mirrors into
-SF's content detection via `/system/etc/init/vndk.rc`). The governor brings
-the power saving back without the tear churn.
+The tearing is a kernel-side bug: the MTK display low-power thread cycles
+vblank off and on under the HWC's feet. `displowpower.sh` keeps that thread out
+of the vblank path, and the governor brings the power saving back.
 
 Tested on: SHARK8RU0006472, AOSP GSI TP1A.220624.014 (user build) + KernelSU
-0.9.4, vendor hwcomposer-2-3 (mtk_common).
+0.9.4, vendor hwcomposer-2-3 (mtk_common). Kernel 5.10.223-rama982-gki-v1.19.
 
 ## Root cause
 
-The panel's vblank is alive and well (disp_aal0 IRQ ticks at exactly 120Hz,
-`drmWaitVBlank` on `/dev/dri/card0` succeeds with real timestamps), but the
-single "smart refresh" feature on this stack kept **re-applying the display
-mode every ~200-400ms**: SurfaceFlinger's content detection
-(`ro.surface_flinger.use_content_detection_for_refresh_rate`), fed at boot by
-`persist.sys.phh.dynamic_fps` through `/system/etc/init/vndk.rc` -- the two
-toggles are one switch split across two UIs.
+`mtk_drm_idlemgr` (kernel threads `mtk_drm_disp_id` and `dis_ki`) decides the
+display is idle and calls `drm_crtc_vblank_off`, then `drm_crtc_vblank_on`
+about 20-25 ms later. The window is measured, not guessed: kprobes on both
+functions plus on `drm_wait_vblank_ioctl` show the off/on pairs bracketing the
+`waitNextVsync -1` failures one for one.
 
-Every mode re-application makes the kernel run
-`drm_crtc_vblank_off` -> `..._vblank_on`. While the vblank is off, the vendor
-HWC's `DrmModeResource::waitNextVsync` (a plain `drmWaitVBlank`, type
-RELATIVE seq=1) fails instantly with -EINVAL. During those windows the HWC
-presents/validates OVL layers with no anchor to the scanout, so a frame
-submitted mid-window shows up as a tear line. With the churn running
-continuously, scrolling hit such windows constantly.
+While the vblank is off, `drm_vblank_get` refuses new waiters with -EINVAL
+(22), so the vendor HWC's `DrmModeResource::waitNextVsync` fails outright. The
+HWC then presents with no anchor to the scanout, and a frame submitted inside
+one of those windows shows up as a tear line.
 
-### Evidence (kprobe trace of drm_wait_vblank_ioctl)
+The cycle is not tied to the refresh rate. Pinned 60, pinned 120 and adaptive
+all cycle identically - roughly two to three off/on pairs per second at 120 Hz -
+and all fail the same share of vsync waits. Nor is it SurfaceFlinger content
+detection: that switch is off here and the cycle persists unchanged.
 
-Before: bursts of `arg1=0xffffffea` (-22, EINVAL) every ~1s while vblank was
-cycled by kernel threads `mtk_drm_disp_id`/`dis_ki` (drm_crtc_vblank_off) --
-~40% of waits failed.
+### Evidence
 
-After (both props off): `0` failures, `21/21` successes under active swipes,
-persistent across reboot.
+kprobe counts over 15 s windows, screen confirmed ON every second of the window.
+`idletime` is the driver's own low-power threshold in frames; the stock value is
+51, about 425 ms at 120 Hz, which is the period of the off/on cycle.
+
+| `idletime` | `drm_crtc_vblank_off` | `drm_crtc_vblank_on` | `waitNextVsync -1` |
+|---|---|---|---|
+| 51 (stock) | 33, 34, 34, 41 | 33, 34, 34, 41 | 78, 87, 72, 53 |
+| 5000 | 0, 0, 0, 0 | 0, 0, 0, 0 | 0, 0, 0, 0 |
+
+Four reversals each way, and no window where the two disagree. Restoring 51
+brings the failures straight back.
 
 ## Fix
 
-Exactly two properties, applied early enough for SurfaceFlinger to read them
-at startup (module `system.prop`, injected by ksud before SF starts):
+`displowpower.sh` (run once per boot from `service.sh`) writes the display
+low-power threshold:
+
+```
+/sys/kernel/debug/displowpower/idletime
+```
+
+Raised from the stock 51 to 5000 frames, `mtk_drm_idlemgr` never reaches its
+idle decision while the panel is in use, so vblank stays up, the HWC's vsync
+wait always succeeds, and tearing is gone.
+
+The kernel keeps the value: it held for 120 s across a sleep/wake cycle and
+governor rate changes without being rewritten, so this is a one-shot write and
+not a watchdog. The panel still sleeps normally - `KEYCODE_SLEEP` still takes
+`mScreenState` to OFF and back - because screen-off does not go through this
+threshold.
+
+Tuning: `setprop persist.sys.phh.disp_idletime <frames>` before the module
+starts. Logging is gated by the same `persist.sys.phh.fps_gov_log` as the
+governor.
+
+### Why not from userspace
+
+Holding a vblank reference from userspace would be the elegant fix, and it does
+not work on this kernel:
+
+* `DRM_VBLANK_FLAG_DONTBLOCK`, and any nonzero `flags` at all, is rejected with
+  EBUSY, so a queued event cannot be armed.
+* A blocking wait does not block. A kprobe on `drm_wait_vblank_ioctl` and
+  `drm_vblank_get` counted 1,050,400 entries in 6 s (~175k/s) from a tight
+  loop: the reference is taken and dropped within microseconds.
+
+A/B over 15 s windows: baseline `off=21, fail=51`, with the hold running
+`off=20, fail=52`. No effect. There is no module to patch either - the driver
+is 3.5 MB of code linked into the kernel image (`/sys/module/mediatek_drm`
+exists with no `parameters/`, and no `.ko` is on disk in `/vendor_dlkm`,
+`/odm_dlkm` or `/vendor/lib/modules`). A debugfs threshold is the only lever
+this stack offers.
+
+### The two properties
 
 ```
 ro.surface_flinger.use_content_detection_for_refresh_rate=0
 persist.sys.phh.dynamic_fps=0
 ```
 
-Result: the panel stays locked at 120Hz, vblank never turns off, the HWC's
-vsync wait always succeeds, SF locks to the real hardware clock, and tearing
-is gone.
+These are still set (`system.prop`). They kill the stock dynamic FPS and stop SF
+from re-applying the display mode, which is worth having on its own, but they
+are not what fixes the tearing: with both off, the vblank cycle measured above
+was unchanged.
 
 ## FPS governor
 
@@ -73,6 +116,36 @@ The switch goes through the DisplayModeDirector user-settings votes:
 settings put system min_refresh_rate 120  (or 60)
 settings put system peak_refresh_rate 120  (or 60)
 ```
+
+## Pinned rates (app control)
+
+The daemon also takes a rate from outside, over the same fifo the touchscreen
+events arrive on. `fps_ctl.sh` is that interface:
+
+```
+sh /data/adb/modules/shark8-smartrefresh/fps_ctl.sh 60
+sh /data/adb/modules/shark8-smartrefresh/fps_ctl.sh 120
+sh /data/adb/modules/shark8-smartrefresh/fps_ctl.sh adaptive
+sh /data/adb/modules/shark8-smartrefresh/fps_ctl.sh status
+```
+
+- `adaptive` - the touch-driven switching above, nothing pinned.
+- `60` / `120` - the panel is pinned and the loop stops writing to it entirely,
+  which also means a pinned rate costs nothing while it is idle.
+- `status` - `mode=... cur=... down=...`: the mode, the rate the daemon
+  believes it reached, and whether a finger is on the glass right now.
+
+Every one of those is answered before the command returns, a rate change
+included. `fps_ctl.sh` writes into the fifo and reads the answer off a fifo of
+its own, with a timeout: a change that did not land fails loudly instead of
+being reported as done. With no daemon there is nobody to talk to, so the
+script writes the votes itself for `60`/`120` and refuses `adaptive`, which
+needs something choosing the rate.
+
+The mode lives in the daemon and dies with it - a restart or a reboot comes
+back `adaptive`. That is deliberate. A file left on disk is a mode nobody is
+holding, and a UI showing `120` over a panel idling at 60 is lying. `status`
+reports `mode=none` in that case and the app shows `stopped`.
 
 Verified behavior on this GSI:
 - `60/60`  -> panel holds 60 Hz (values are NOT rewritten).
@@ -122,6 +195,72 @@ v1.4 fixes this three ways:
 * `service.sh` removes stale pidfile/fifo at boot before starting, making
   every boot a clean start regardless of how the previous session ended
 
+### Startup robustness (v1.5)
+
+v1.4 fixed the dead-on-boot guard. v1.5 removes the startup wait and the two
+things that hid behind it:
+
+* **no readiness probe.** There was a `while ! settings get ... ; sleep 2` loop
+  that could idle for 90s before the daemon did anything. It guarded a case
+  that does not need guarding: at boot the votes already read `Infinity`,
+  i.e. 120, so in the default adaptive mode nothing is written at all. The
+  check now lives in the write itself -- `go` only records the new rate after
+  reading it back, so a write the provider refused is simply not latched and
+  the next pass of the loop (at most `IDLE_S` later) tries again. Same
+  self-healing, no waiting, and the log stays quiet because only a confirmed
+  write is logged
+* **a missing mode file reads as `adaptive`.** `mode_now` returned the raw
+  file content, so with no `.fps_gov.mode` on disk it returned the empty
+  string, which the idle pass compared against `mode=adaptive`, found
+  different, and answered by calling `apply_mode` -- on every single pass,
+  forever. The 60 Hz drop was below that branch and never ran, so a device
+  where the app had never written a mode sat at 120 Hz permanently. The file
+  is normalized to `adaptive` when it is absent or unreadable
+* **`USR1` is trapped before anything can block.** The trap went in next to
+  the loop while the pidfile had been written 90 lines earlier, so a `USR1`
+  from the app during startup hit the default action of the signal and killed
+  the daemon. It is installed immediately after the pidfile now
+
+### Control channel (v1.6)
+
+v1.5 asked for a rate with a file and a signal: `echo 60 > .fps_gov.mode`, then
+`kill -USR1`. It worked, and it carried three problems that are not worth
+keeping.
+
+* **The writer could not tell whether it landed.** A file write plus a signal
+  are both fire-and-forget. A `USR1` that lost a race left the mode file saying
+  `60` and the panel at 120: two sources of truth, one of them a lie. (The
+  v1.5 trap-before-pidfile fix was this same bug seen from the daemon's side.)
+* **The state outlived the thing that owned it.** A reboot left
+  `.fps_gov.mode` on disk, the daemon read it at startup and came up pinned, so
+  a phone rebooted days later was still in a mode nobody had asked for since.
+* **Three things to learn** where one will do: a file, a signal and a pidfile.
+
+v1.6 is one fifo and a request/response. `SET <mode> <replypath>` and
+`GET - <replypath>`, both answered `mode=... cur=... down=...` on the caller's
+fifo. No file, no signal, no persisted mode.
+
+The fifo has one reader, and three details make it behave:
+
+* `getevent` writes it and the loop reads it, and the loop holds the read end
+  open with `exec 3<"$fifo"`. A writer blocks on a fifo only while nobody is
+  reading, so holding that end is what lets `fps_ctl.sh` hand over a command
+  without waiting.
+* It is opened **read-only**, not `<>`. Read-write would keep the write end open
+  as well, and then a `getevent` that dies never closes it: the read below
+  would then sit out a full `IDLE_S` on every pass instead of noticing at
+  once. A read-only fd returns EOF the moment the last writer goes, which is
+  what the `kill -0 $gepid` check behind it exists to act on.
+* The reply fifo is opened `exec 9<>` by both sides, because with only one of
+  them holding it the other blocks forever on the open. The daemon does it in a
+  subshell: a failed redirection on `exec` is fatal in the calling shell, and
+  the calling shell is the governor.
+* A command is not a touch. The control branch `continue`s, so asking for
+  status does not push the panel back to 120.
+
+The cost is that the mode does not survive a restart, and `fps_ctl.sh` prices
+that honestly rather than hiding it.
+
 ## Install
 
 ```
@@ -142,6 +281,8 @@ adb root
 adb shell 'dumpsys SurfaceFlinger | grep ContentDetection'   # expect: false
 adb shell getprop ro.surface_flinger.use_content_detection_for_refresh_rate  # 0
 adb shell getprop persist.sys.phh.dynamic_fps                                # 0
+adb shell cat /sys/kernel/debug/displowpower/idletime                      # 5000
+adb shell logcat -d -s disp_idle:*                         # idletime 51 -> 5000 frames
 adb shell sh /data/local/tmp/monitor_wait_vsync.sh 4 2       # expect 0 failures
 ```
 
@@ -155,22 +296,32 @@ Governor sanity (idle should settle at 60 Hz, then jump to 120 on touch):
 ```
 adb shell getprop ro.surface_flinger.use_content_detection_for_refresh_rate  # 0
 adb shell 'sleep 5; settings get system min_refresh_rate'   # 60 while idle
-sendevent /dev/input/event2 3 47 0; sendevent /dev/input/event2 3 57 5
-sendevent /dev/input/event2 3 53 540; sendevent /dev/input/event2 3 54 1200
-sendevent /dev/input/event2 1 330 1; sendevent /dev/input/event2 0 0 0
-adb shell 'sleep 2; settings get system min_refresh_rate'   # Infinity (=120)
+adb shell 'sh /data/adb/modules/shark8-smartrefresh/fps_ctl.sh status'
 adb shell logcat -d -s fps_gov:*                            # transitions logged
 ```
 
-Note on synthetic events: the fts_ts vendor driver drops injected full press
-frames (ABS_MT_TRACKING_ID set from userspace is rejected), but it does
-deliver the release frame (`3 57 -1; 1 330 0; 0 0 0`) and BTN_TOUCH lines from
-real fingers. So the `sendevent` press above still proves the governor reacts;
-for a hands-free latch test inject only the release frame. Real-finger
-validation: hold the screen still for > `IDLE_S` seconds -- the panel must
-stay at 120 the whole time (`settings get system min_refresh_rate` -> Infinity)
-and only drop to 60 after lifting, then `logcat` shows `finger down` / `finger
-up` / `set rate to 60 Hz`.
+Note on synthetic events: `sendevent` does not work on this device, and it
+does not admit it. Every `write()` to an evdev node returns `EINVAL` - checked
+for all nine event types on all six nodes, touchscreen and PMIC keys alike -
+while toybox `sendevent` throws the write result away and exits 0. So an
+injection appears to succeed and delivers nothing, and a control node filters
+exactly as hard as the touch node does. (An earlier version of this file
+claimed the `fts_ts` driver passed release frames through. It does not; nothing
+gets through.) `input tap` is no help either, it injects at the InputDispatcher
+and never reaches evdev.
+
+The touch path is therefore verified by hand: hold the screen still for more
+than `IDLE_S` seconds - the panel must stay at 120 the whole time
+(`settings get system min_refresh_rate` -> `Infinity`) and only drop to 60 after
+lifting. `logcat -d -s fps_gov` then shows `finger down`, then
+`set rate to 60 Hz`, then `finger up`.
+
+What the governor matches on is `0001 014a 00000001` (BTN_TOUCH down) and
+`0001 014a 00000000` (up) as a suffix match, so it does not care whether the
+line carries a device prefix. The format is not a guess: real `getevent -t`
+output was captured on device and prints exactly `0001 014a 00000001`, and
+BTN_TOUCH is `0x14a` under `EV_KEY` in the kernel ABI, so a touchscreen that
+reports a finger reports it that way.
 
 ## Scroll jank check (render health)
 
@@ -196,9 +347,11 @@ trade-off, not a defect.
 ```
 module/                KernelSU module (installable as-is)
   module.prop
-  system.prop          the two fix props, applied at boot
-  service.sh           starts the fps governor at boot
+  system.prop          the two props, applied at boot
+  service.sh           starts the low-power fix and the fps governor at boot
+  displowpower.sh      raises /sys/kernel/debug/displowpower/idletime once
   fps_governor.sh      touch-driven 60/120 Hz daemon
+  fps_ctl.sh           60 / 120 / adaptive / status over the governor's fifo
 tools/
   vblank_probe.c       standalone drmWaitVBlank probe (NDK cross-compile)
   monitor_wait_vsync.sh  kprobe watcher for waitNextVsync success/failure

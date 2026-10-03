@@ -1,6 +1,6 @@
 id=shark8-smartrefresh
 name=Shark8 SmartRefresh
-version=1.4
-versionCode=5
+version=1.7
+versionCode=8
 author=jan
-description=Fix screen tearing (disable SF content detection) and replace MTK dynamic FPS with a clean touch-driven 60/120 Hz governor via DMS user-settings votes. No drm_crtc_vblank churn, no waitNextVsync EINVAL bursts, still battery-friendly on static content.
+description=Fix screen tearing by keeping the MTK display low-power path out of the vblank path (mtk_drm_idlemgr no longer cycles drm_crtc_vblank_off while the HWC is waiting), and replace MTK dynamic FPS with a clean touch-driven 60/120 Hz governor. No drm_crtc_vblank churn, no waitNextVsync EINVAL bursts.
