@@ -282,9 +282,17 @@ adb shell 'dumpsys SurfaceFlinger | grep ContentDetection'   # expect: false
 adb shell getprop ro.surface_flinger.use_content_detection_for_refresh_rate  # 0
 adb shell getprop persist.sys.phh.dynamic_fps                                # 0
 adb shell cat /sys/kernel/debug/displowpower/idletime                      # 5000
-adb shell logcat -d -s disp_idle:*                         # idletime 51 -> 5000 frames
 adb shell sh /data/local/tmp/monitor_wait_vsync.sh 4 2       # expect 0 failures
 ```
+
+The node is the source of truth, and reading it is enough: `displowpower.sh`
+writes it once at boot and the kernel keeps it, so if it reads `5000` the fix is
+applied. The `idletime 51 -> 5000 frames` line it writes to `logcat -s
+disp_idle` is a convenience only. The main ring buffer on this device is 256 KiB
+and does not survive long, so on a device that has been up for a while the line
+is usually already evicted and its absence means nothing. Read it within the
+first few minutes after a reboot, or run `sh
+/data/adb/modules/shark8-smartrefresh/displowpower.sh` to reproduce it.
 
 The kprobe monitor prints the count of -EINVAL vs success results from the
 HWC's waitNextVsync under synthetic swipes. Run it once with the fix removed
